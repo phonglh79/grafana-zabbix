@@ -12,17 +12,118 @@ export function expandItemName(name, key) {
 
   // extract params from key:
   // "system.cpu.util[,system,avg1]" --> ["", "system", "avg1"]
-  var key_params = key.substring(key.indexOf('[') + 1, key.lastIndexOf(']')).split(',');
+  let key_params_str = key.substring(key.indexOf('[') + 1, key.lastIndexOf(']'));
+  let key_params = splitKeyParams(key_params_str);
 
   // replace item parameters
-  for (var i = key_params.length; i >= 1; i--) {
+  for (let i = key_params.length; i >= 1; i--) {
     name = name.replace('$' + i, key_params[i - 1]);
   }
   return name;
 }
 
+export function expandItems(items) {
+  _.forEach(items, item => {
+    item.item = item.name;
+    item.name = expandItemName(item.item, item.key_);
+    return item;
+  });
+  return items;
+}
+
+function splitKeyParams(paramStr) {
+  let params = [];
+  let quoted = false;
+  let in_array = false;
+  let split_symbol = ',';
+  let param = '';
+
+  _.forEach(paramStr, symbol => {
+    if (symbol === '"' && in_array) {
+      param += symbol;
+    } else if (symbol === '"' && quoted) {
+      quoted = false;
+    } else if (symbol === '"' && !quoted) {
+      quoted = true;
+    } else if (symbol === '[' && !quoted) {
+      in_array  = true;
+    } else if (symbol === ']' && !quoted) {
+      in_array = false;
+    } else if (symbol === split_symbol && !quoted && !in_array) {
+      params.push(param);
+      param = '';
+    } else {
+      param += symbol;
+    }
+  });
+
+  params.push(param);
+  return params;
+}
+
+const MACRO_PATTERN = /{\$[A-Z0-9_\.]+}/g;
+
+export function containsMacro(itemName) {
+  return MACRO_PATTERN.test(itemName);
+}
+
+export function replaceMacro(item, macros) {
+  let itemName = item.name;
+  let item_macros = itemName.match(MACRO_PATTERN);
+  _.forEach(item_macros, macro => {
+    let host_macros = _.filter(macros, m => {
+      if (m.hostid) {
+        return m.hostid === item.hostid;
+      } else {
+        // Add global macros
+        return true;
+      }
+    });
+
+    let macro_def = _.find(host_macros, { macro: macro });
+    if (macro_def && macro_def.value) {
+      let macro_value = macro_def.value;
+      let macro_regex = new RegExp(escapeMacro(macro));
+      itemName = itemName.replace(macro_regex, macro_value);
+    }
+  });
+
+  return itemName;
+}
+
+function escapeMacro(macro) {
+  macro = macro.replace(/\$/, '\\\$');
+  return macro;
+}
+
+/**
+ * Split template query to parts of zabbix entities
+ * group.host.app.item -> [group, host, app, item]
+ * {group}{host.com} -> [group, host.com]
+ */
+export function splitTemplateQuery(query) {
+  let splitPattern = /\{[^\{\}]*\}|\{\/.*\/\}/g;
+  let split;
+
+  if (isContainsBraces(query)) {
+    let result = query.match(splitPattern);
+    split = _.map(result, part => {
+      return _.trim(part, '{}');
+    });
+  } else {
+    split = query.split('.');
+  }
+
+  return split;
+}
+
+function isContainsBraces(query) {
+  let bracesPattern = /^\{.+\}$/;
+  return bracesPattern.test(query);
+}
+
 // Pattern for testing regex
-export var regexPattern = /^\/(.*)\/([gmi]*)$/m;
+export const regexPattern = /^\/(.*)\/([gmi]*)$/m;
 
 export function isRegex(str) {
   return regexPattern.test(str);
@@ -123,6 +224,19 @@ export function callOnce(func, promiseKeeper) {
       );
     }
     return promiseKeeper;
+  };
+}
+
+/**
+ * Apply function one by one: `sequence([a(), b(), c()]) = c(b(a()))`
+ * @param {*} funcsArray functions to apply
+ */
+export function sequence(funcsArray) {
+  return function(result) {
+    for (var i = 0; i < funcsArray.length; i++) {
+      result = funcsArray[i].call(this, result);
+    }
+    return result;
   };
 }
 

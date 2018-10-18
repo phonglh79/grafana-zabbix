@@ -3,20 +3,21 @@ import * as dateMath from 'app/core/utils/datemath';
 import * as utils from './utils';
 import * as migrations from './migrations';
 import * as metricFunctions from './metricFunctions';
+import * as c from './constants';
 import dataProcessor from './dataProcessor';
 import responseHandler from './responseHandler';
-import './zabbix.js';
-import './zabbixAlerting.service.js';
-import {ZabbixAPIError} from './zabbixAPICore.service.js';
+import { Zabbix } from './zabbix/zabbix';
+import { ZabbixAPIError } from './zabbix/connectors/zabbix_api/zabbixAPICore';
 
-class ZabbixAPIDatasource {
+export class ZabbixDatasource {
 
   /** @ngInject */
-  constructor(instanceSettings, templateSrv, alertSrv, dashboardSrv, zabbixAlertingSrv, Zabbix) {
+  constructor(instanceSettings, templateSrv, backendSrv, datasourceSrv, zabbixAlertingSrv) {
     this.templateSrv = templateSrv;
-    this.alertSrv = alertSrv;
-    this.dashboardSrv = dashboardSrv;
     this.zabbixAlertingSrv = zabbixAlertingSrv;
+
+    // Use custom format for template variables
+    this.replaceTemplateVars = _.partial(replaceTemplateVars, this.templateSrv);
 
     // General data source settings
     this.name             = instanceSettings.name;
@@ -24,28 +25,47 @@ class ZabbixAPIDatasource {
     this.basicAuth        = instanceSettings.basicAuth;
     this.withCredentials  = instanceSettings.withCredentials;
 
+    const jsonData = migrations.migrateDSConfig(instanceSettings.jsonData);
+
     // Zabbix API credentials
-    this.username         = instanceSettings.jsonData.username;
-    this.password         = instanceSettings.jsonData.password;
+    this.username         = jsonData.username;
+    this.password         = jsonData.password;
 
     // Use trends instead history since specified time
-    this.trends           = instanceSettings.jsonData.trends;
-    this.trendsFrom       = instanceSettings.jsonData.trendsFrom || '7d';
-    this.trendsRange      = instanceSettings.jsonData.trendsRange || '4d';
+    this.trends           = jsonData.trends;
+    this.trendsFrom       = jsonData.trendsFrom || '7d';
+    this.trendsRange      = jsonData.trendsRange || '4d';
 
     // Set cache update interval
-    var ttl = instanceSettings.jsonData.cacheTTL || '1h';
+    var ttl = jsonData.cacheTTL || '1h';
     this.cacheTTL = utils.parseInterval(ttl);
 
     // Alerting options
-    this.alertingEnabled = instanceSettings.jsonData.alerting;
-    this.addThresholds = instanceSettings.jsonData.addThresholds;
-    this.alertingMinSeverity = instanceSettings.jsonData.alertingMinSeverity || 2;
+    this.alertingEnabled =     jsonData.alerting;
+    this.addThresholds =       jsonData.addThresholds;
+    this.alertingMinSeverity = jsonData.alertingMinSeverity || c.SEV_WARNING;
 
-    this.zabbix = new Zabbix(this.url, this.username, this.password, this.basicAuth, this.withCredentials, this.cacheTTL);
+    // Other options
+    this.disableReadOnlyUsersAck = jsonData.disableReadOnlyUsersAck;
 
-    // Use custom format for template variables
-    this.replaceTemplateVars = _.partial(replaceTemplateVars, this.templateSrv);
+    // Direct DB Connection options
+    this.enableDirectDBConnection = jsonData.dbConnectionEnable || false;
+    this.dbConnectionDatasourceId = jsonData.dbConnectionDatasourceId;
+    this.dbConnectionDatasourceName = jsonData.dbConnectionDatasourceName;
+
+    let zabbixOptions = {
+      url: this.url,
+      username: this.username,
+      password: this.password,
+      basicAuth: this.basicAuth,
+      withCredentials: this.withCredentials,
+      cacheTTL: this.cacheTTL,
+      enableDirectDBConnection: this.enableDirectDBConnection,
+      dbConnectionDatasourceId: this.dbConnectionDatasourceId,
+      dbConnectionDatasourceName: this.dbConnectionDatasourceName
+    };
+
+    this.zabbix = new Zabbix(zabbixOptions, backendSrv, datasourceSrv);
   }
 
   ////////////////////////
@@ -58,16 +78,6 @@ class ZabbixAPIDatasource {
    * @return {Object} Grafana metrics object with timeseries data for each target.
    */
   query(options) {
-    let timeFrom = Math.ceil(dateMath.parse(options.range.from) / 1000);
-    let timeTo = Math.ceil(dateMath.parse(options.range.to) / 1000);
-
-    let useTrendsFrom = Math.ceil(dateMath.parse('now-' + this.trendsFrom) / 1000);
-    let useTrendsRange = Math.ceil(utils.parseInterval(this.trendsRange) / 1000);
-    let useTrends = this.trends && (
-      (timeFrom <= useTrendsFrom) ||
-      (timeTo - timeFrom >= useTrendsRange)
-    );
-
     // Get alerts for current panel
     if (this.alertingEnabled) {
       this.alertQuery(options).then(alert => {
@@ -83,91 +93,98 @@ class ZabbixAPIDatasource {
     }
 
     // Create request for each target
-    let promises = _.map(options.targets, target => {
+    let promises = _.map(options.targets, t => {
+      // Don't request for hidden targets
+      if (t.hide) {
+        return [];
+      }
+
+      let timeFrom = Math.ceil(dateMath.parse(options.range.from) / 1000);
+      let timeTo = Math.ceil(dateMath.parse(options.range.to) / 1000);
+
       // Prevent changes of original object
-      target = _.cloneDeep(target);
+      let target = _.cloneDeep(t);
       this.replaceTargetVariables(target, options);
 
       // Apply Time-related functions (timeShift(), etc)
       let timeFunctions = bindFunctionDefs(target.functions, 'Time');
       if (timeFunctions.length) {
-        const [time_from, time_to] = sequence(timeFunctions)([timeFrom, timeTo]);
+        const [time_from, time_to] = utils.sequence(timeFunctions)([timeFrom, timeTo]);
         timeFrom = time_from;
         timeTo = time_to;
       }
+      let timeRange = [timeFrom, timeTo];
+
+      let useTrends = this.isUseTrends(timeRange);
 
       // Metrics or Text query mode
-      if (target.mode !== 1) {
+      if (!target.mode || target.mode === c.MODE_METRICS || target.mode === c.MODE_TEXT) {
         // Migrate old targets
         target = migrations.migrate(target);
 
-        // Don't request undefined and hidden targets
-        if (target.hide || !target.group || !target.host || !target.item) {
+        // Don't request undefined targets
+        if (!target.group || !target.host || !target.item) {
           return [];
         }
 
-        if (!target.mode || target.mode === 0) {
-          return this.queryNumericData(target, timeFrom, timeTo, useTrends);
-        } else if (target.mode === 2) {
-          return this.queryTextData(target, timeFrom, timeTo);
+        if (!target.mode || target.mode === c.MODE_METRICS) {
+          return this.queryNumericData(target, timeRange, useTrends, options);
+        } else if (target.mode === c.MODE_TEXT) {
+          return this.queryTextData(target, timeRange);
         }
-      }
-
-      // IT services mode
-      else if (target.mode === 1) {
-        // Don't show undefined and hidden targets
-        if (target.hide || !target.itservice || !target.slaProperty) {
+      } else if (target.mode === c.MODE_ITEMID) {
+        // Item ID mode
+        if (!target.itemids) {
           return [];
         }
-
-        return this.zabbix.getSLA(target.itservice.serviceid, timeFrom, timeTo)
-        .then(slaObject => {
-          return responseHandler.handleSLAResponse(target.itservice, target.slaProperty, slaObject);
-        });
+        return this.queryItemIdData(target, timeRange, useTrends, options);
+      } else if (target.mode === c.MODE_ITSERVICE) {
+        // IT services mode
+        return this.queryITServiceData(target, timeRange, options);
+      } else if (target.mode === c.MODE_TRIGGERS) {
+        // Triggers mode
+        return this.queryTriggersData(target, timeRange);
+      } else {
+        return [];
       }
     });
 
     // Data for panel (all targets)
     return Promise.all(_.flatten(promises))
       .then(_.flatten)
-      .then(timeseries_data => {
-        return downsampleSeries(timeseries_data, options);
-      })
       .then(data => {
         return { data: data };
       });
   }
 
-  queryNumericData(target, timeFrom, timeTo, useTrends) {
-    let options = {
+  /**
+   * Query target data for Metrics mode
+   */
+  queryNumericData(target, timeRange, useTrends, options) {
+    let getItemOptions = {
       itemtype: 'num'
     };
-    return this.zabbix.getItemsFromTarget(target, options)
-    .then(items => {
-      let getHistoryPromise;
+    return this.zabbix.getItemsFromTarget(target, getItemOptions)
+    .then(items => this.queryNumericDataForItems(items, target, timeRange, useTrends, options));
+  }
 
-      if (useTrends) {
-        let valueType = this.getTrendValueType(target);
-        getHistoryPromise = this.zabbix.getTrend(items, timeFrom, timeTo)
-          .then(history => {
-            return responseHandler.handleTrends(history, items, valueType);
-          });
-      } else {
-        // Use history
-        getHistoryPromise = this.zabbix.getHistory(items, timeFrom, timeTo)
-          .then(history => {
-            return responseHandler.handleHistory(history, items);
-          });
-      }
+  /**
+   * Query history for numeric items
+   */
+  queryNumericDataForItems(items, target, timeRange, useTrends, options) {
+    let getHistoryPromise;
+    options.valueType = this.getTrendValueType(target);
+    options.consolidateBy = getConsolidateBy(target) || options.valueType;
 
-      return getHistoryPromise.then(timeseries_data => {
-        return this.applyDataProcessingFunctions(timeseries_data, target);
-      });
-    })
-    .catch(error => {
-      console.log(error);
-      return [];
-    });
+    if (useTrends) {
+      getHistoryPromise = this.zabbix.getTrends(items, timeRange, options);
+    } else {
+      getHistoryPromise = this.zabbix.getHistoryTS(items, timeRange, options);
+    }
+
+    return getHistoryPromise
+    .then(timeseries => this.applyDataProcessingFunctions(timeseries, target))
+    .then(timeseries => downsampleSeries(timeseries, options));
   }
 
   getTrendValueType(target) {
@@ -186,20 +203,20 @@ class ZabbixAPIDatasource {
     let aliasFunctions       = bindFunctionDefs(target.functions, 'Alias');
 
     // Apply transformation functions
-    timeseries_data = _.map(timeseries_data, timeseries => {
-      timeseries.datapoints = sequence(transformFunctions)(timeseries.datapoints);
+    timeseries_data = _.cloneDeep(_.map(timeseries_data, timeseries => {
+      timeseries.datapoints = utils.sequence(transformFunctions)(timeseries.datapoints);
       return timeseries;
-    });
+    }));
 
     // Apply filter functions
     if (filterFunctions.length) {
-      timeseries_data = sequence(filterFunctions)(timeseries_data);
+      timeseries_data = utils.sequence(filterFunctions)(timeseries_data);
     }
 
     // Apply aggregations
     if (aggregationFunctions.length) {
       let dp = _.map(timeseries_data, 'datapoints');
-      dp = sequence(aggregationFunctions)(dp);
+      dp = utils.sequence(aggregationFunctions)(dp);
 
       let aggFuncNames = _.map(metricFunctions.getCategories()['Aggregate'], 'name');
       let lastAgg = _.findLast(target.functions, func => {
@@ -213,7 +230,7 @@ class ZabbixAPIDatasource {
     }
 
     // Apply alias functions
-    _.forEach(timeseries_data, sequence(aliasFunctions));
+    _.forEach(timeseries_data, utils.sequence(aliasFunctions));
 
     // Apply Time-related functions (timeShift(), etc)
     // Find timeShift() function and get specified trend value
@@ -235,39 +252,102 @@ class ZabbixAPIDatasource {
     }
   }
 
-  queryTextData(target, timeFrom, timeTo) {
+  /**
+   * Query target data for Text mode
+   */
+  queryTextData(target, timeRange) {
     let options = {
       itemtype: 'text'
     };
     return this.zabbix.getItemsFromTarget(target, options)
-      .then(items => {
-        if (items.length) {
-          return this.zabbix.getHistory(items, timeFrom, timeTo)
-          .then(history => {
-            return responseHandler.handleText(history, items, target);
-          });
-        } else {
-          return Promise.resolve([]);
-        }
-      });
+    .then(items => {
+      return this.zabbix.getHistoryText(items, timeRange, target);
+    });
   }
 
   /**
-   * Test connection to Zabbix API
-   * @return {object} Connection status and Zabbix API version
+   * Query target data for Item ID mode
+   */
+  queryItemIdData(target, timeRange, useTrends, options) {
+    let itemids = target.itemids;
+    itemids = this.templateSrv.replace(itemids, options.scopedVars, zabbixItemIdsTemplateFormat);
+    itemids = _.map(itemids.split(','), itemid => itemid.trim());
+
+    if (!itemids) {
+      return [];
+    }
+
+    return this.zabbix.getItemsByIDs(itemids)
+    .then(items => {
+      return this.queryNumericDataForItems(items, target, timeRange, useTrends, options);
+    });
+  }
+
+  /**
+   * Query target data for IT Services mode
+   */
+  queryITServiceData(target, timeRange, options) {
+    // Don't show undefined and hidden targets
+    if (target.hide || (!target.itservice && !target.itServiceFilter) || !target.slaProperty) {
+      return [];
+    }
+
+    let itServiceFilter;
+    options.isOldVersion = target.itservice && !target.itServiceFilter;
+
+    if (options.isOldVersion) {
+      // Backward compatibility
+      itServiceFilter = '/.*/';
+    } else {
+      itServiceFilter = this.replaceTemplateVars(target.itServiceFilter, options.scopedVars);
+    }
+
+    return this.zabbix.getITServices(itServiceFilter)
+    .then(itservices => {
+      return this.zabbix.getSLA(itservices, timeRange, target, options);
+    });
+  }
+
+  queryTriggersData(target, timeRange) {
+    let [timeFrom, timeTo] = timeRange;
+    return this.zabbix.getHostsFromTarget(target)
+    .then((results) => {
+      let [hosts, apps] = results;
+      if (hosts.length) {
+        let hostids = _.map(hosts, 'hostid');
+        let appids = _.map(apps, 'applicationid');
+        let options = {
+          minSeverity: target.triggers.minSeverity,
+          acknowledged: target.triggers.acknowledged,
+          count: target.triggers.count,
+          timeFrom: timeFrom,
+          timeTo: timeTo
+        };
+        return this.zabbix.getHostAlerts(hostids, appids, options)
+        .then((triggers) => {
+          return responseHandler.handleTriggersResponse(triggers, timeRange);
+        });
+      } else {
+        return Promise.resolve([]);
+      }
+    });
+  }
+
+  /**
+   * Test connection to Zabbix API and external history DB.
    */
   testDatasource() {
-    let zabbixVersion;
-    return this.zabbix.getVersion()
-    .then(version => {
-      zabbixVersion = version;
-      return this.zabbix.login();
-    })
-    .then(() => {
+    return this.zabbix.testDataSource()
+    .then(result => {
+      const { zabbixVersion, dbConnectorStatus } = result;
+      let message = `Zabbix API version: ${zabbixVersion}`;
+      if (dbConnectorStatus) {
+        message += `, DB connector type: ${dbConnectorStatus.dsType}`;
+      }
       return {
         status: "success",
         title: "Success",
-        message: "Zabbix API version: " + zabbixVersion
+        message: message
       };
     })
     .catch(error => {
@@ -275,9 +355,22 @@ class ZabbixAPIDatasource {
         return {
           status: "error",
           title: error.message,
-          message: error.data
+          message: error.message
+        };
+      } else if (error.data && error.data.message) {
+        return {
+          status: "error",
+          title: "Connection failed",
+          message: "Connection failed: " + error.data.message
+        };
+      } else if (typeof(error) === 'string') {
+        return {
+          status: "error",
+          title: "Connection failed",
+          message: "Connection failed: " + error
         };
       } else {
+        console.log(error);
         return {
           status: "error",
           title: "Connection failed",
@@ -303,7 +396,7 @@ class ZabbixAPIDatasource {
     let parts = [];
 
     // Split query. Query structure: group.host.app.item
-    _.each(query.split('.'), part => {
+    _.each(utils.splitTemplateQuery(query), part => {
       part = this.replaceTemplateVars(part, {});
 
       // Replace wildcard to regex
@@ -347,27 +440,30 @@ class ZabbixAPIDatasource {
     var timeFrom = Math.ceil(dateMath.parse(options.rangeRaw.from) / 1000);
     var timeTo = Math.ceil(dateMath.parse(options.rangeRaw.to) / 1000);
     var annotation = options.annotation;
-    var showOkEvents = annotation.showOkEvents ? [0, 1] : 1;
+    var showOkEvents = annotation.showOkEvents ? c.SHOW_ALL_EVENTS : c.SHOW_OK_EVENTS;
 
     // Show all triggers
-    var showTriggers = [0, 1];
+    let triggersOptions = {
+      showTriggers: c.SHOW_ALL_TRIGGERS,
+      hideHostsInMaintenance: false
+    };
 
-    var getTriggers = this.zabbix
-      .getTriggers(this.replaceTemplateVars(annotation.group, {}),
-                   this.replaceTemplateVars(annotation.host, {}),
-                   this.replaceTemplateVars(annotation.application, {}),
-                   showTriggers);
+    var getTriggers = this.zabbix.getTriggers(this.replaceTemplateVars(annotation.group, {}),
+                                              this.replaceTemplateVars(annotation.host, {}),
+                                              this.replaceTemplateVars(annotation.application, {}),
+                                              triggersOptions);
 
     return getTriggers.then(triggers => {
 
       // Filter triggers by description
-      if (utils.isRegex(annotation.trigger)) {
+      let triggerName = this.replaceTemplateVars(annotation.trigger, {});
+      if (utils.isRegex(triggerName)) {
         triggers = _.filter(triggers, trigger => {
-          return utils.buildRegex(annotation.trigger).test(trigger.description);
+          return utils.buildRegex(triggerName).test(trigger.description);
         });
-      } else if (annotation.trigger) {
+      } else if (triggerName) {
         triggers = _.filter(triggers, trigger => {
-          return trigger.description === annotation.trigger;
+          return trigger.description === triggerName;
         });
       }
 
@@ -418,7 +514,9 @@ class ZabbixAPIDatasource {
    */
   alertQuery(options) {
     let enabled_targets = filterEnabledTargets(options.targets);
-    let getPanelItems = _.map(enabled_targets, target => {
+    let getPanelItems = _.map(enabled_targets, t => {
+      let target = _.cloneDeep(t);
+      this.replaceTargetVariables(target, options);
       return this.zabbix.getItemsFromTarget(target, {itemtype: 'num'});
     });
 
@@ -427,6 +525,9 @@ class ZabbixAPIDatasource {
       let items = _.flatten(results);
       let itemids = _.map(items, 'itemid');
 
+      if (itemids.length === 0) {
+        return [];
+      }
       return this.zabbix.getAlerts(itemids);
     })
     .then(triggers => {
@@ -478,6 +579,16 @@ class ZabbixAPIDatasource {
     });
   }
 
+  isUseTrends(timeRange) {
+    let [timeFrom, timeTo] = timeRange;
+    let useTrendsFrom = Math.ceil(dateMath.parse('now-' + this.trendsFrom) / 1000);
+    let useTrendsRange = Math.ceil(utils.parseInterval(this.trendsRange) / 1000);
+    let useTrends = this.trends && (
+      (timeFrom <= useTrendsFrom) ||
+      (timeTo - timeFrom >= useTrendsRange)
+    );
+    return useTrends;
+  }
 }
 
 function bindFunctionDefs(functionDefs, category) {
@@ -492,11 +603,24 @@ function bindFunctionDefs(functionDefs, category) {
   });
 }
 
+function getConsolidateBy(target) {
+  let consolidateBy;
+  let funcDef = _.find(target.functions, func => {
+    return func.def.name === 'consolidateBy';
+  });
+  if (funcDef && funcDef.params && funcDef.params.length) {
+    consolidateBy = funcDef.params[0];
+  }
+  return consolidateBy;
+}
+
 function downsampleSeries(timeseries_data, options) {
+  let defaultAgg = dataProcessor.aggregationFunctions['avg'];
+  let consolidateByFunc = dataProcessor.aggregationFunctions[options.consolidateBy] || defaultAgg;
   return _.map(timeseries_data, timeseries => {
     if (timeseries.datapoints.length > options.maxDataPoints) {
       timeseries.datapoints = dataProcessor
-        .groupBy(options.interval, dataProcessor.AVERAGE, timeseries.datapoints);
+        .groupBy(options.interval, consolidateByFunc, timeseries.datapoints);
     }
     return timeseries;
   });
@@ -519,13 +643,20 @@ function formatMetric(metricObj) {
  * template variables, for example
  * /CPU $cpu_item.*time/ where $cpu_item is system,user,iowait
  */
-function zabbixTemplateFormat(value) {
+export function zabbixTemplateFormat(value) {
   if (typeof value === 'string') {
     return utils.escapeRegex(value);
   }
 
   var escapedValues = _.map(value, utils.escapeRegex);
   return '(' + escapedValues.join('|') + ')';
+}
+
+function zabbixItemIdsTemplateFormat(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+  return value.join(',');
 }
 
 /**
@@ -544,17 +675,6 @@ function replaceTemplateVars(templateSrv, target, scopedVars) {
   return replacedTarget;
 }
 
-// Apply function one by one:
-// sequence([a(), b(), c()]) = c(b(a()));
-function sequence(funcsArray) {
-  return function(result) {
-    for (var i = 0; i < funcsArray.length; i++) {
-      result = funcsArray[i].call(this, result);
-    }
-    return result;
-  };
-}
-
 function filterEnabledTargets(targets) {
   return _.filter(targets, target => {
     return !(target.hide || !target.group || !target.host || !target.item);
@@ -562,7 +682,7 @@ function filterEnabledTargets(targets) {
 }
 
 function getTriggerThreshold(expression) {
-  let thresholdPattern = /.*[<>]([\d\.]+)/;
+  let thresholdPattern = /.*[<>=]{1,2}([\d\.]+)/;
   let finded_thresholds = expression.match(thresholdPattern);
   if (finded_thresholds && finded_thresholds.length >= 2) {
     let threshold = finded_thresholds[1];
@@ -572,8 +692,6 @@ function getTriggerThreshold(expression) {
     return null;
   }
 }
-
-export {ZabbixAPIDatasource, zabbixTemplateFormat};
 
 // Fix for backward compatibility with lodash 2.4
 if (!_.includes) {_.includes = _.contains;}

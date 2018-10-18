@@ -1,10 +1,10 @@
 Functions reference
 ===================
 
-Transform
----------
+## Transform
 
-### groupBy
+
+### _groupBy_
 
 ```
 groupBy(interval, function)
@@ -17,8 +17,9 @@ Examples:
 groupBy(10m, avg)
 groupBy(1h, median)
 ```
+---
 
-### scale
+### _scale_
 ```
 scale(factor)
 ```
@@ -29,18 +30,65 @@ Examples:
 scale(100)
 scale(0.01)
 ```
+---
 
-### delta
+### _delta_
 ```
 delta()
 ```
-Convert absolute values to delta, for example, bits to bits/sec.
+Converts absolute values to delta. This function just calculate difference between values. For the per-second
+calculation use `rate()`.
+---
 
+### _rate_
+```
+rate()
+```
+Calculates the per-second rate of increase of the time series. Resistant to counter reset. Suitable for converting of
+growing counters into the per-sercond rate.
+---
 
-Aggregate
----------
+### _movingAverage_
+```
+movingAverage(windowSize)
+```
+Graphs the moving average of a metric over a fixed number of past points, specified by `windowSize` param.
 
-### aggregateBy
+Examples:
+```
+movingAverage(60)
+calculates moving average over 60 points (if metric has 1 second resolution it matches 1 minute window)
+```
+---
+
+### _exponentialMovingAverage_
+```
+exponentialMovingAverage(windowSize)
+```
+Takes a series of values and a window size and produces an exponential moving average utilizing the following formula:  
+`ema(current) = constant * (Current Value) + (1 - constant) * ema(previous)`
+
+The Constant is calculated as:  
+`constant = 2 / (windowSize + 1)`
+
+If windowSize < 1 (0.1, for instance), Constant wouldn't be calculated and will be taken directly from windowSize
+(Constant = windowSize).
+
+It's a bit tricky to graph EMA from the first point of series (not from Nth = windowSize). In order to do it,
+plugin should fetch previous N points first and calculate simple moving average for it. To avoid it, plugin uses this
+hack: assume, previous N points have the same average values as first N (windowSize). So you should keep this fact
+in mind and don't rely on first N points interval.
+
+Examples:
+```
+movingAverage(60)
+calculates moving average over 60 points (if metric has 1 second resolution it matches 1 minute window)
+```
+---
+
+## Aggregate
+
+### _aggregateBy_
 ```
 aggregateBy(interval, function)
 ```
@@ -52,37 +100,44 @@ Examples:
 aggregateBy(10m, avg)
 aggregateBy(1h, median)
 ```
+---
 
-### sumSeries
+### _sumSeries_
 ```
 sumSeries()
 ```
 
 This will add metrics together and return the sum at each datapoint. This method required interpolation of each timeseries so it may cause high CPU load. Try to combine it with _groupBy()_ function to reduce load.
 
-### average
+---
+
+### _average_
 ```
 average(interval)
 ```
 **Deprecated**, use `aggregateBy(interval, avg)` instead.
 
-### min
+---
+
+### _min_
 ```
 min(interval)
 ```
 **Deprecated**, use `aggregateBy(interval, min)` instead.
 
-### max
+---
+
+### _max_
 ```
 max(interval)
 ```
 **Deprecated**, use `aggregateBy(interval, max)` instead.
 
+---
 
-Filter
----------
+## Filter
 
-### top
+### _top_
 
 ```
 top(N, value)
@@ -95,8 +150,9 @@ Examples:
 top(10, avg)
 top(5, max)
 ```
+---
 
-### bottom
+### _bottom_
 
 ```
 bottom(N, value)
@@ -108,20 +164,22 @@ Examples:
 ```
 bottom(5, avg)
 ```
-
+---
 
 ## Trends
 
-### trendValue
+### _trendValue_
 ```
 trendValue(valueType)
 ```
 
 Specifying type of trend value returned by Zabbix when trends are used (avg, min or max).
 
+---
+
 ## Time
 
-### timeShift
+### _timeShift_
 ```
 timeShift(interval)
 ```
@@ -132,10 +190,11 @@ timeShift(24h)  - shift metric back in 24h hours
 timeShift(-24h) - the same result as for timeShift(24h)
 timeShift(+1d)  - shift metric forward in 1 day
 ```
+---
 
 ## Alias
 
-### setAlias
+### _setAlias_
 ```
 setAlias(alias)
 ```
@@ -146,8 +205,9 @@ Examples:
 ```
 setAlias(load)
 ```
+---
 
-### setAliasByRegex
+### _setAliasByRegex_
 ```
 setAliasByRegex(regex)
 ```
@@ -158,8 +218,9 @@ Examples:
 ```
 setAlias(Zabbix busy [a-zA-Z]+)
 ```
+---
 
-### replaceAlias
+### _replaceAlias_
 ```
 replaceAlias(pattern, newAlias)
 ```
@@ -190,3 +251,17 @@ replaceAlias(/.*CPU (.*) time/, $1) -> system
 backend01: CPU system time
 replaceAlias(/(.*): CPU (.*) time/, $1 - $2) -> backend01 - system
 ```
+---
+
+## Special
+
+### _consolidateBy_
+```
+consolidateBy(consolidationFunc)
+```
+
+When a graph is drawn where width of the graph size in pixels is smaller than the number of datapoints to be graphed, plugin consolidates the values to to prevent line overlap. The consolidateBy() function changes the consolidation function from the default of average to one of `sum`, `min`, `max` or `count`.
+
+Valid function names are `sum`, `avg`, `min`, `max` and `count`.
+
+---

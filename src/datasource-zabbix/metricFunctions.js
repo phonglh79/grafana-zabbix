@@ -8,7 +8,8 @@ var categories = {
   Filter: [],
   Trends: [],
   Time: [],
-  Alias: []
+  Alias: [],
+  Special: []
 };
 
 function addFuncDef(funcDef) {
@@ -50,6 +51,31 @@ addFuncDef({
   defaultParams: [],
 });
 
+addFuncDef({
+  name: 'rate',
+  category: 'Transform',
+  params: [],
+  defaultParams: [],
+});
+
+addFuncDef({
+  name: 'movingAverage',
+  category: 'Transform',
+  params: [
+    { name: 'factor', type: 'int', options: [6, 10, 60, 100, 600] }
+  ],
+  defaultParams: [10],
+});
+
+addFuncDef({
+  name: 'exponentialMovingAverage',
+  category: 'Transform',
+  params: [
+    { name: 'smoothing', type: 'float', options: [6, 10, 60, 100, 600] }
+  ],
+  defaultParams: [0.2],
+});
+
 // Aggregate
 
 addFuncDef({
@@ -75,6 +101,16 @@ addFuncDef({
     { name: 'interval', type: 'string' }
   ],
   defaultParams: ['1m'],
+});
+
+addFuncDef({
+  name: 'percentil',
+  category: 'Aggregate',
+  params: [
+    { name: 'interval', type: 'string' },
+    { name: 'percent', type: 'float', options: [25, 50, 75, 90, 95, 99, 99.9] }
+  ],
+  defaultParams: ['1m', 95],
 });
 
 addFuncDef({
@@ -145,6 +181,15 @@ addFuncDef({
   defaultParams: [5, 'avg'],
 });
 
+addFuncDef({
+  name: 'sortSeries',
+  category: 'Filter',
+  params: [
+    { name: 'direction', type: 'string', options: ['asc', 'desc'] }
+  ],
+  defaultParams: ['asc']
+});
+
 // Trends
 
 addFuncDef({
@@ -195,6 +240,16 @@ addFuncDef({
     { name: 'newAlias', type: 'string' }
   ],
   defaultParams: ['/(.*)/', '$1']
+});
+
+// Special
+addFuncDef({
+  name: 'consolidateBy',
+  category: 'Special',
+  params: [
+    { name: 'type', type: 'string', options: ['avg', 'min', 'max', 'sum', 'count'] }
+  ],
+  defaultParams: ['avg'],
 });
 
 _.each(categories, function(funcList, catName) {

@@ -4,12 +4,45 @@ module.exports = function(grunt) {
 
   grunt.loadNpmTasks('grunt-execute');
   grunt.loadNpmTasks('grunt-contrib-clean');
+  grunt.loadNpmTasks('grunt-benchmark');
 
   grunt.initConfig({
 
-    clean: ["dist"],
+    clean: {
+      dist: {
+        src: ["dist"]
+      },
+      test: {
+        src: ["dist/test"]
+      },
+      vendor: {
+        src: ["vendor"]
+      },
+      tmp: {
+        src: ["tmp"]
+      }
+    },
 
     copy: {
+      node_modules: {
+        cwd: './node_modules',
+        expand: true,
+        flatten: true,
+        filter: 'isFile',
+        src: [
+          'tether-drop/dist/js/drop.min.js',
+          'tether/dist/js/tether.min.js',
+        ],
+        dest: 'vendor/npm'
+      },
+      vendor_to_dist: {
+        cwd: 'vendor',
+        expand: true,
+        src: [
+          '**/*'
+        ],
+        dest: 'dist/vendor'
+      },
       src_to_dist: {
         cwd: 'src',
         expand: true,
@@ -18,6 +51,7 @@ module.exports = function(grunt) {
           '!datasource-zabbix/*.js',
           '!panel-triggers/*.js',
           '!components/*.js',
+          '!vendor/*.js',
           '!module.js',
           '!**/*.scss'
         ],
@@ -40,7 +74,7 @@ module.exports = function(grunt) {
 
     babel: {
       options: {
-        presets:  ["es2015"]
+        presets: ["es2015"]
       },
       dist: {
         options: {
@@ -51,9 +85,10 @@ module.exports = function(grunt) {
           cwd: 'src',
           expand: true,
           src: [
-            'datasource-zabbix/*.js',
+            'datasource-zabbix/**/*.js',
             'panel-triggers/*.js',
             'components/*.js',
+            'vendor/*.js',
             'module.js',
           ],
           dest: 'dist/'
@@ -77,25 +112,14 @@ module.exports = function(grunt) {
       }
     },
 
-    mochaTest: {
-      test: {
-        options: {
-          reporter: 'spec'
-        },
-        src: [
-          'dist/test/datasource-zabbix/specs/test-main.js',
-          'dist/test/datasource-zabbix/specs/*_specs.js'
-        ]
-      }
-    },
-
     sass: {
       options: {
         sourceMap: true
       },
       dist: {
         files: {
-          'dist/panel-triggers/css/panel_triggers.css' : 'src/panel-triggers/sass/panel_triggers.scss',
+          'dist/css/grafana-zabbix.light.css': 'src/sass/grafana-zabbix.light.scss',
+          'dist/css/grafana-zabbix.dark.css': 'src/sass/grafana-zabbix.dark.scss'
         }
       }
     },
@@ -112,6 +136,7 @@ module.exports = function(grunt) {
         ignores: [
           'node_modules/*',
           'dist/*',
+          'src/datasource-zabbix/benchmarks/*'
         ]
       }
     },
@@ -121,28 +146,43 @@ module.exports = function(grunt) {
       options: {
         config: ".jscs.json",
       },
+    },
+
+    benchmark: {
+      options: {
+        displayResults: true
+      },
+      timeseriesBench: {
+        src: ['dist/test/datasource-zabbix/benchmarks/*.js'],
+        dest: 'tmp/benchmark.csv'
+      }
     }
 
   });
 
   grunt.registerTask('default', [
     'clean',
-    'copy:src_to_dist',
-    'copy:pluginDef',
+    'sass',
+    'copy',
     'jshint',
     'jscs',
-    'sass',
-    'babel',
-    'mochaTest'
+    'babel:dist'
   ]);
 
   grunt.registerTask('watchTask', [
-    'clean',
-    'copy:src_to_dist',
-    'copy:pluginDef',
+    'clean:dist',
     'sass',
-    'babel',
+    'copy',
+    'babel:dist',
     'jshint',
     'jscs'
+  ]);
+
+  grunt.registerTask('bench', [
+    'clean:test',
+    'clean:tmp',
+    'babel:distTestNoSystemJs',
+    'babel:distTestsSpecsNoSystemJs',
+    'benchmark'
   ]);
 };
